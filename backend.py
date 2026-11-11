@@ -449,10 +449,58 @@ Forecast:
 
 
 
+
+
+# =========================
+# Budget Agent
+# =========================
+def budget_agent(state: TravelState):
+    prompt = f"""
+Analyze whether this trip is realistic for the user's budget.
+
+User Query:
+{state['user_query']}
+
+Trip Constraints:
+{state.get('trip_constraints', {})}
+
+Flight Results:
+{state.get('flight_results', '')}
+
+Hotel Results:
+{state.get('hotel_results', '')}
+
+Weather Results:
+{state.get('weather_results', '')}
+
+Return:
+1. Estimated cost categories
+2. Budget risk areas
+3. Money-saving suggestions
+4. Overall feasibility
+
+If exact live prices are unavailable, clearly label estimates as approximate.
+"""
+
+    response = llm.invoke(
+        [
+            SystemMessage(content="You are a practical travel budget analyst."),
+            HumanMessage(content=prompt),
+        ]
+    )
+
+    return {
+        "budget_results": response.content,
+        "messages": [AIMessage(content="Budget assessment generated.")],
+        "llm_calls": state.get("llm_calls", 0) + 1,
+    }
+
+
+
+
 # =========================
 # Itinerary Agent
 # =========================
-
 def itinerary_agent(state: TravelState):
     prompt = f"""
 Create a complete travel itinerary.
@@ -460,27 +508,42 @@ Create a complete travel itinerary.
 User Query:
 {state['user_query']}
 
+Trip Constraints:
+{state.get('trip_constraints', {})}
+
 Flight Results:
-{state['flight_results']}
+{state.get('flight_results', '')}
 
 Hotel Results:
-{state['hotel_results']}
+{state.get('hotel_results', '')}
 
 Weather Results:
-{state['weather_results']}
+{state.get('weather_results', '')}
+
+Budget Results:
+{state.get('budget_results', '')}
 
 Make the itinerary practical, budget-aware, and easy to follow.
+Create a clear draft that is ready for human review.
 """
 
-    response = llm.invoke([
-        SystemMessage(content="You are an expert travel planner."),
-        HumanMessage(content=prompt)
-    ])
+    response = llm.invoke(
+        [
+            SystemMessage(content="You are an expert travel planner."),
+            HumanMessage(content=prompt),
+        ]
+    )
+
+    approval_request = (
+        "Please review the generated draft itinerary. Approve it to create the "
+        "final polished plan, or provide feedback for revision."
+    )
 
     return {
         "itinerary": response.content,
-        "messages": [response],
-        "llm_calls": state.get("llm_calls", 0) + 1
+        "approval_request": approval_request,
+        "messages": [AIMessage(content="Draft itinerary created for human review.")],
+        "llm_calls": state.get("llm_calls", 0) + 1,
     }
 
 
