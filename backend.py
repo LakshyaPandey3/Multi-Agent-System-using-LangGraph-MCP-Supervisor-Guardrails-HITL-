@@ -147,12 +147,157 @@ def _empty_constraints() -> dict[str, Any]:
 
 
 
+# =========================
+# Supervisor Agent + Input Guardrail
+# =========================
+def supervisor_agent(state: TravelState):
+    query = state["user_query"]
+    llm_calls = state.get("llm_calls", 0)
+
+    guardrail_prompt = f"""
+Determine whether the following request belongs to travel planning or travel
+information. Valid requests can include destinations, flights, hotels, weather,
+budgets, visas, transportation, sightseeing, food, packing, or itineraries.
+
+Block clearly unrelated requests and requests asking for harmful or illegal
+instructions. Do not block a valid travel request merely because some details
+are missing.
+
+Return strict JSON only:
+{{
+  "allowed": true,
+  "reason": ""
+}}
+
+User request:
+{query}
+"""
+
+    # Fail open on parser/model errors so a temporary JSON-format issue does not
+    # break the original travel-planning behavior.
+    try:
+        guardrail_raw = _llm_text(
+            "You are the input guardrail for a travel-planning application. "
+            "Return strict JSON only.",
+            guardrail_prompt,
+        )
+        guardrail_result = _json_from_llm(guardrail_raw)
+        allowed = bool(guardrail_result.get("allowed", True))
+        guardrail_reason = str(guardrail_result.get("reason", "")).strip()
+        llm_calls += 1
+    except Exception as exc:
+        print(f"Guardrail fallback used: {exc}")
+        allowed = True
+        guardrail_reason = "Guardrail validation fallback allowed the request."
+
+    if not allowed:
+        reason = guardrail_reason or (
+            "TripMate AI can only help with travel-planning requests. "
+            "Please ask about a destination, flight, hotel, weather, budget, "
+            "or itinerary."
+        )
+        return {
+            "guardrail_allowed": False,
+            "guardrail_reason": reason,
+            "selected_agents": [],
+            "trip_constraints": _empty_constraints(),
+            "supervisor_reasoning": reason,
+            "final_response": reason,
+            "messages": [AIMessage(content=f"Guardrail blocked request: {reason}")],
+            "llm_calls": llm_calls,
+        }
+
+    supervisor_prompt = f"""
+You are the supervisor of a multi-agent travel-planning system.
+Choose only the specialist agents needed for the request.
+
+Available agents:
+- flight_agent: flights, airports, airlines, routes, airfare, or booking advice
+- hotel_agent: hotels, accommodation, neighborhoods, or places to stay
+- weather_agent: weather, climate, season, forecast, or packing advice
+- budget_agent: cost, affordability, price limits, or budget feasibility
+- itinerary_agent: creates the integrated travel plan and must always be included
+
+Return strict JSON only using this schema:
+{{
+  "selected_agents": ["flight_agent", "hotel_agent", "weather_agent", "budget_agent", "itinerary_agent"],
+  "trip_constraints": {{
+    "destination": "",
+    "origin": "",
+    "duration": "",
+    "budget": "",
+    "travel_style": "",
+    "special_preferences": []
+  }},
+  "reasoning": ""
+}}
+
+User request:
+{query}
+"""
+
+    try:
+        supervisor_raw = _llm_text(
+            "You route work to travel specialist agents. Return strict JSON only.",
+            supervisor_prompt,
+        )
+        parsed = _json_from_llm(supervisor_raw)
+        requested_agents = parsed.get("selected_agents", [])
+        selected_agents = [
+            name for name in AGENT_ORDER
+            if name in requested_agents and name in KNOWN_AGENTS
+        ]
+
+        # The itinerary agent integrates whichever specialist results were selected.
+        if "itinerary_agent" not in selected_agents:
+            selected_agents.append("itinerary_agent")
+
+        constraints = _empty_constraints()
+        parsed_constraints = parsed.get("trip_constraints", {})
+        if isinstance(parsed_constraints, dict):
+            constraints.update(parsed_constraints)
+
+        reasoning = str(parsed.get("reasoning", "")).strip()
+        llm_calls += 1
+    except Exception as exc:
+        print(f"Supervisor fallback used: {exc}")
+        # Original workflow behavior is preserved as the fallback.
+        selected_agents = AGENT_ORDER.copy()
+        constraints = _empty_constraints()
+        reasoning = (
+            "Supervisor parsing failed, so the original full travel workflow "
+            "was selected as a safe fallback."
+        )
+
+    return {
+        "guardrail_allowed": True,
+        "guardrail_reason": guardrail_reason,
+        "selected_agents": selected_agents,
+        "trip_constraints": constraints,
+        "supervisor_reasoning": reasoning,
+        "messages": [AIMessage(content="Supervisor created the agent plan.")],
+        "llm_calls": llm_calls,
+    }
+
+
+# =========================
+# Guardrail blocked response
+# =========================
+def guardrail_blocked_agent(state: TravelState):
+    reason = state.get("final_response") or state.get("guardrail_reason") or (
+        "This request was blocked by the travel input guardrail."
+    )
+    return {
+        "final_response": reason,
+        "messages": [AIMessage(content=reason)],
+    }
+
+
+
 
 # =========================
 # Flight Agent
 # =========================
-
-# Flight Tool Router Prompt
 FLIGHT_AGENT_PROMPT = """
 You are a travel flight expert.
 
@@ -166,7 +311,6 @@ Airline Information:
 {airline_data}
 
 Generate:
-
 1. Likely departure airport
 2. Likely arrival airport
 3. Airlines serving this route
@@ -179,28 +323,13 @@ Return concise travel guidance.
 """
 
 
-
-
-# Flight Agent
 def flight_agent(state: TravelState):
     print("\nINSIDE FLIGHT AGENT\n")
-
     query = state["user_query"]
 
     try:
-
-        airports = asyncio.run(
-            aviation_mcp_call(
-                "list_airports"
-            )
-        )
-
-        airlines = asyncio.run(
-            aviation_mcp_call(
-                "list_airlines"
-            )
-        )
-
+        airports = asyncio.run(aviation_mcp_call("list_airports"))
+        airlines = asyncio.run(aviation_mcp_call("list_airlines"))
 
         print("\nAIRPORTS:", airports)
         print("\nAIRLINES:", airlines)
@@ -208,65 +337,77 @@ def flight_agent(state: TravelState):
         prompt = FLIGHT_AGENT_PROMPT.format(
             query=query,
             airport_data=str(airports)[:3000],
-            airline_data=str(airlines)[:3000]
+            airline_data=str(airlines)[:3000],
         )
 
-        response = llm.invoke([
-            SystemMessage(
-                content="You are an expert travel flight planner."
-            ),
-            HumanMessage(content=prompt)
-        ])
-
+        response = llm.invoke(
+            [
+                SystemMessage(content="You are an expert travel flight planner."),
+                HumanMessage(content=prompt),
+            ]
+        )
         flight_data = response.content
-
-    except Exception as e:
-
-        flight_data = f"Flight information unavailable: {str(e)}"
+    except Exception as exc:
+        flight_data = f"Flight information unavailable: {exc}"
 
     return {
         "flight_results": flight_data,
-        "messages": [
-            AIMessage(
-                content="Flight recommendations generated"
-            )
-        ],
-        "llm_calls": state.get("llm_calls", 0) + 1
+        "messages": [AIMessage(content="Flight recommendations generated")],
+        "llm_calls": state.get("llm_calls", 0) + 1,
     }
-
-
 
 
 
 # =========================
 # Hotel Agent
 # =========================
-
 def hotel_agent(state: TravelState):
-    query = f"Best hotels for {state['user_query']}"
-    # hotel_results = tavily_search(query)
-    hotel_results = asyncio.run(tavily_mcp_search(query))
+    query = (
+        f"Best hotels for "
+        f"{state['user_query']}"
+    )
+
+    try:
+        hotel_results = asyncio.run(
+            tavily_mcp_search(query)
+        )
+
+    except Exception as exc:
+        print(
+            f"HOTEL AGENT MCP ERROR: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+        hotel_results = (
+            "Live hotel search is temporarily unavailable. "
+            "Provide general accommodation and neighborhood "
+            "guidance based on the destination and clearly "
+            "label it as non-live advice."
+        )
 
     return {
         "hotel_results": hotel_results,
         "messages": [
-            AIMessage(content="Hotel information fetched.")
+            AIMessage(
+                content="Hotel information processed."
+            )
         ],
-        "llm_calls": state.get("llm_calls", 0) + 1
+        "llm_calls": (
+            state.get("llm_calls", 0) + 1
+        ),
     }
-
-
 
 
 # =========================
 # Weather Agent
 # =========================
-
 def weather_agent(state: TravelState):
+    city = extract_destination(
+        state["user_query"]
+    )
 
     try:
-        city = extract_destination(state["user_query"])
-
         weather_data = asyncio.run(
             weather_mcp_search(city)
         )
@@ -276,24 +417,34 @@ def weather_agent(state: TravelState):
         )
 
         weather_results = f"""
-        Current Weather:
-        {weather_data}
+Current Weather:
+{weather_data}
 
-        Forecast:
-        {forecast_data}
-        """
+Forecast:
+{forecast_data}
+"""
 
-        message = "Weather information fetched"
+    except Exception as exc:
+        print(
+            f"WEATHER AGENT MCP ERROR: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
 
-    except Exception as e:
-        weather_results = f"Weather information unavailable: {str(e)}"
-        message = "Weather information could not be fetched"
+        weather_results = (
+            f"Live weather information for {city} "
+            "is temporarily unavailable. Give general "
+            "seasonal guidance and advise the traveler "
+            "to verify the forecast before departure."
+        )
 
     return {
         "weather_results": weather_results,
         "messages": [
-            AIMessage(content=message)
-        ]
+            AIMessage(
+                content="Weather information processed."
+            )
+        ],
     }
 
 
